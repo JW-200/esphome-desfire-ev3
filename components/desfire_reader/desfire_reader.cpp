@@ -23,24 +23,41 @@ void DesfireReaderComponent::recover_i2c_bus_() {
     return;
   }
 
-  ESP_LOGD(TAG, "I2C bus recovery — clocking out stuck state (SDA=%d SCL=%d)",
-           sda_pin_, scl_pin_);
-
-  // Force-reset the I2C peripheral by doing a dummy write that will
-  // timeout, which triggers the ESP-IDF driver's internal reset.
-  // Then send 9 clock pulses on SCL to release any stuck SDA.
-
   gpio_num_t sda = (gpio_num_t)sda_pin_;
   gpio_num_t scl = (gpio_num_t)scl_pin_;
 
-  // Temporarily take control of SCL as GPIO to clock out stuck slave
-  gpio_reset_pin(scl);
-  gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
-  gpio_set_level(scl, 1);
-
+  // ── SAFETY GUARD ────────────────────────────────────────────────────────────
+  // Only steal the bus if SDA is genuinely stuck low.  Unconditionally clocking
+  // SCL while other devices are mid-transaction would corrupt their data.
+  //
+  // Configuring SDA as a plain GPIO input briefly disconnects it from the I2C
+  // peripheral, but if SDA is already stuck low the peripheral is already in
+  // an error state — no successful transaction can be in flight.
   gpio_reset_pin(sda);
   gpio_set_direction(sda, GPIO_MODE_INPUT);
   gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
+  delayMicroseconds(20);  // let the external pullup charge the line
+
+  if (gpio_get_level(sda) != 0) {
+    // SDA is already high — the bus is not stuck.  The I2C peripheral will
+    // recover on its own; no GPIO manipulation needed.
+    gpio_reset_pin(sda);   // restore to default input, I2C driver reclaims on next tx
+    ESP_LOGD(TAG, "I2C bus recovery: SDA already free — skipping clock-out");
+    uint8_t dummy;
+    this->read(&dummy, 1);  // triggers ESP-IDF's internal I2C error recovery
+    return;
+  }
+
+  // SDA is stuck low.  Warn: the 9-clock sequence will briefly interrupt any
+  // other I2C device sharing this physical bus (same SDA/SCL wires).
+  ESP_LOGW(TAG, "I2C bus recovery — SDA stuck low, clocking out "
+           "(SDA=GPIO%d SCL=GPIO%d). Other I2C devices on this bus may be "
+           "briefly interrupted.", sda_pin_, scl_pin_);
+
+  // Take control of SCL to clock out the stuck slave
+  gpio_reset_pin(scl);
+  gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
+  gpio_set_level(scl, 1);
 
   // Clock 9 times — if SDA is stuck low, this lets the slave release it
   for (int i = 0; i < 9; i++) {
@@ -48,7 +65,6 @@ void DesfireReaderComponent::recover_i2c_bus_() {
     delayMicroseconds(5);
     gpio_set_level(scl, 1);
     delayMicroseconds(5);
-    // Check if SDA is released
     if (gpio_get_level(sda) == 1)
       break;
   }
@@ -62,15 +78,20 @@ void DesfireReaderComponent::recover_i2c_bus_() {
   gpio_set_level(sda, 1);
   delayMicroseconds(5);
 
-  // Release GPIO pins back to I2C peripheral
-  // ESPHome's I2C component will reclaim them on next transaction
-  gpio_reset_pin(sda);
-  gpio_reset_pin(scl);
+  // Leave SCL and SDA as open-drain HIGH rather than calling gpio_reset_pin().
+  // gpio_reset_pin() clears the GPIO-matrix connections that ESPHome set up
+  // during I2C init, permanently severing the I2C peripheral from the physical
+  // pins until the next reboot.  Leaving them as OD-HIGH is the I2C idle state;
+  // the throwaway read below will fail (expected), which causes the ESP-IDF I2C
+  // master driver to run its own internal error-recovery path — that path
+  // re-connects the GPIO matrix, restoring normal operation.
+  gpio_set_direction(scl, GPIO_MODE_INPUT_OUTPUT_OD);
+  gpio_set_level(scl, 1);
+  gpio_set_direction(sda, GPIO_MODE_INPUT_OUTPUT_OD);
+  gpio_set_level(sda, 1);
 
-  // Re-init I2C by doing a small throwaway read
-  // This forces the ESP-IDF I2C driver to re-initialize
   uint8_t dummy;
-  this->read(&dummy, 1);  // will likely fail, that's OK
+  this->read(&dummy, 1);  // expected to fail; triggers ESP-IDF I2C error recovery
 #else
   // ESP8266: just wait a bit, the hardware is simpler
   delay(10);
@@ -91,7 +112,8 @@ void DesfireReaderComponent::pn532_wakeup_() {
 bool DesfireReaderComponent::write_command_(const uint8_t *cmd, uint8_t cmd_len) {
   uint8_t frame[PN532_BUF_SIZE];
   uint8_t len = cmd_len + 1;
-  uint8_t total = 6 + cmd_len + 2;
+  // Use uint16_t to avoid wrapping if cmd_len is near 255.
+  uint16_t total = (uint16_t)6 + cmd_len + 2;
 
   if (total > sizeof(frame))
     return false;

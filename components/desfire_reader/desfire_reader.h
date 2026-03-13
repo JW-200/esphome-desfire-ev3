@@ -27,7 +27,11 @@ static const uint8_t DESFIRE_MORE_FRAMES = 0xAF;
 static const uint8_t PN532_CMD_IN_DATA_EXCHANGE = 0x40;
 static const uint8_t PN532_CMD_IN_LIST_PASSIVE = 0x4A;
 static const uint8_t PN532_CMD_IN_RELEASE = 0x52;
-static const uint8_t PN532_BUF_SIZE = 64;
+// Must be uint16_t: a uint8_t constant wraps silently to 0 if set above 255,
+// causing immediate stack corruption. 128 bytes gives comfortable headroom
+// over the 64-byte max used by current APDUs and prevents silent truncation
+// of longer PN532 responses (e.g. multi-block ReadData, extended UID).
+static const uint16_t PN532_BUF_SIZE = 128;
 
 static const uint16_t COOLDOWN_SUCCESS_MS = 150;
 static const uint16_t COOLDOWN_RETRY_MS = 50;
