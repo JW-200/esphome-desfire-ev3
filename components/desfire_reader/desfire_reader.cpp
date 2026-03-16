@@ -1295,6 +1295,14 @@ void DesfireReaderComponent::loop() {
       // cmd_ctr_ was already incremented after ReadData response.
       // Card also incremented before computing response — counters match.
 
+      // Verify response MAC over the ENCRYPTED data (what was on the wire)
+      if (!verify_resp_mac_(DESFIRE_OK, resp_data, data_len, resp_mac)) {
+        ESP_LOGE(TAG, "FULL: CMAC verification FAILED");
+        handle_fail_();
+        return;
+      }
+
+      // Decrypt with session ENC key
       uint8_t iv[16];
       compute_ev2_iv_(true, iv);
       aes_cbc_decrypt_with_key_(ses_auth_enc_rk_, resp_data, data_len, iv, decrypted);
@@ -1305,13 +1313,6 @@ void DesfireReaderComponent::loop() {
         dec_len--;
       if (dec_len > 0 && decrypted[dec_len - 1] == 0x80)
         dec_len--;
-
-      if (!verify_resp_mac_(DESFIRE_OK, decrypted, dec_len, resp_mac)) {
-        ESP_LOGE(TAG, "FULL: CMAC verification FAILED");
-        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-        handle_fail_();
-        return;
-      }
 
       ESP_LOGD(TAG, "FULL: decrypted %d bytes, CMAC verified", dec_len);
 
