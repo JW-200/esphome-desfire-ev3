@@ -121,7 +121,7 @@ desfire_reader:
 | Key | Required | Default | Description |
 |-----|----------|---------|-------------|
 | `address` | No | `0x24` | PN532 I2C address |
-| `update_interval` | No | `500ms` | Card polling interval |
+| `update_interval` | No | `50ms` | Card polling interval |
 | `app_id` | **Yes** | — | 3-byte DESFire Application ID (`XX:XX:XX`) |
 | `app_key` | **Yes** | — | 16-byte AES-128 application key (`XX:XX:...:XX`) |
 | `data_key` | No | — | 16-byte AES-128 decryption key (plain mode only) |

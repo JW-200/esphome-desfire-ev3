@@ -58,7 +58,7 @@ CONFIG_SCHEMA = (
         }
     )
     .extend(i2c.i2c_device_schema(0x24))
-    .extend(cv.polling_component_schema("500ms"))
+    .extend(cv.polling_component_schema("50ms"))
 )
 
 
