@@ -1292,8 +1292,8 @@ void DesfireReaderComponent::loop() {
         return;
       }
 
-      uint16_t saved_ctr = cmd_ctr_;
-      cmd_ctr_ = saved_ctr - 1;
+      // cmd_ctr_ was already incremented after ReadData response.
+      // Card also incremented before computing response — counters match.
 
       uint8_t iv[16];
       compute_ev2_iv_(true, iv);
@@ -1308,13 +1308,11 @@ void DesfireReaderComponent::loop() {
 
       if (!verify_resp_mac_(DESFIRE_OK, decrypted, dec_len, resp_mac)) {
         ESP_LOGE(TAG, "FULL: CMAC verification FAILED");
-        cmd_ctr_ = saved_ctr;
         secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
         handle_fail_();
         return;
       }
 
-      cmd_ctr_ = saved_ctr;
       ESP_LOGD(TAG, "FULL: decrypted %d bytes, CMAC verified", dec_len);
 
     } else if (ev2_authenticated_ && comm_mode_ == CommMode::MAC) {
@@ -1329,21 +1327,16 @@ void DesfireReaderComponent::loop() {
       uint8_t *resp_data = raw_file_;
       uint8_t *resp_mac  = raw_file_ + data_len;
 
-      uint16_t saved_ctr = cmd_ctr_;
-      cmd_ctr_ = saved_ctr - 1;
-
       memcpy(decrypted, resp_data, data_len);
       dec_len = data_len;
 
       if (!verify_resp_mac_(DESFIRE_OK, resp_data, data_len, resp_mac)) {
         ESP_LOGE(TAG, "MAC: CMAC verification FAILED");
-        cmd_ctr_ = saved_ctr;
         secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
         handle_fail_();
         return;
       }
 
-      cmd_ctr_ = saved_ctr;
       ESP_LOGD(TAG, "MAC: CMAC verified (%d data bytes)", dec_len);
 
       // If data_key configured, decrypt locally
