@@ -183,7 +183,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t data_rk_[176]{};
   bool has_data_key_{false};
   CommMode comm_mode_{CommMode::PLAIN};
-  bool proximity_check_enabled_{true};
+  bool proximity_check_enabled_{false};
 
   int sda_pin_{-1};
   int scl_pin_{-1};

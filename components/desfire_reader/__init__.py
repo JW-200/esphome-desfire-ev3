@@ -55,7 +55,7 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_AUTH_OK): binary_sensor.binary_sensor_schema(),
             cv.Optional(CONF_UID): text_sensor.text_sensor_schema(),
             cv.Optional(CONF_NONAUTHORISED_CARD_UID): text_sensor.text_sensor_schema(),
-            cv.Optional(CONF_PROXIMITY_CHECK, default=True): cv.boolean,
+            cv.Optional(CONF_PROXIMITY_CHECK, default=False): cv.boolean,
             cv.Optional(CONF_COMM_MODE, default="plain"): cv.enum(COMM_MODES, lower=True),
         }
     )
