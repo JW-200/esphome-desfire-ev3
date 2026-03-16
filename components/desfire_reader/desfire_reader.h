@@ -237,6 +237,7 @@ class DesfireReaderComponent : public PollingComponent, public i2c::I2CDevice {
   uint8_t pc_rnd_r_[PC_NUM_ROUNDS]{};  // Reader's random bytes
   uint8_t pc_rnd_c_[PC_NUM_ROUNDS]{};  // Card's random bytes
   uint8_t pc_current_round_{0};
+  bool pc_failed_this_card_{false};     // Set if PC fails; cleared on new card
 
   static const uint16_t ACK_TIMEOUT_MS = 50;
   static const uint16_t RESP_TIMEOUT_MS = 150;

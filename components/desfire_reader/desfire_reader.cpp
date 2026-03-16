@@ -354,6 +354,7 @@ void DesfireReaderComponent::clear_card_state_() {
   retry_count_ = 0;
   nonauthorised_fail_count_ = 0;
   ev2_authenticated_ = false;
+  pc_failed_this_card_ = false;
   publish_auth_(false);
   publish_result_("");
   publish_uid_("");
@@ -457,7 +458,9 @@ void DesfireReaderComponent::derive_session_keys_() {
   //      || RndB[6:16] || RndA[8:16]
   uint8_t sv[32];
 
-  // SV1 — MAC key
+  // Key mapping empirically validated against working DESFire EV3 cards:
+  //   SV1 (A5 5A prefix) → ENC key
+  //   SV2 (5A A5 prefix) → MAC key
   sv[0] = 0xA5; sv[1] = 0x5A;
   sv[2] = 0x00; sv[3] = 0x01; sv[4] = 0x00; sv[5] = 0x80;
   sv[6] = rnd_a_[0]; sv[7] = rnd_a_[1];
@@ -466,15 +469,14 @@ void DesfireReaderComponent::derive_session_keys_() {
   memcpy(sv + 14, rnd_b_dec_ + 6, 10);
   memcpy(sv + 24, rnd_a_ + 8, 8);
 
-  aes_cmac_(app_rk_, sv, 32, ses_auth_mac_key_);
-  aes_key_exp_(ses_auth_mac_key_, ses_auth_mac_rk_);
-
-  // SV2 — ENC key (same structure, different prefix)
-  sv[0] = 0x5A; sv[1] = 0xA5;
-  // bytes 2..31 are identical to SV1
-
   aes_cmac_(app_rk_, sv, 32, ses_auth_enc_key_);
   aes_key_exp_(ses_auth_enc_key_, ses_auth_enc_rk_);
+
+  // SV2 → MAC key (same body, different prefix)
+  sv[0] = 0x5A; sv[1] = 0xA5;
+
+  aes_cmac_(app_rk_, sv, 32, ses_auth_mac_key_);
+  aes_key_exp_(ses_auth_mac_key_, ses_auth_mac_rk_);
 
   secure_zero_((volatile uint8_t *)sv, sizeof(sv));
 
@@ -1006,10 +1008,12 @@ void DesfireReaderComponent::loop() {
 
       ESP_LOGI(TAG, "Mutual AES EV2 auth verified — secure channel established");
 
-      // Next step: proximity check if enabled, otherwise read
-      if (proximity_check_enabled_) {
+      // Next step: proximity check if enabled and not already failed for this card
+      if (proximity_check_enabled_ && !pc_failed_this_card_) {
         start_proximity_check_();
       } else {
+        if (pc_failed_this_card_)
+          ESP_LOGW(TAG, "Proximity check skipped (card doesn't support it)");
         start_read_file_();
       }
       return;
@@ -1034,9 +1038,9 @@ void DesfireReaderComponent::loop() {
       return;
     }
     if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
-      ESP_LOGW(TAG, "PreparePC ACK timeout — skipping proximity check");
-      // Proximity check failed — proceed to read anyway with warning
-      start_read_file_();
+      ESP_LOGW(TAG, "PreparePC ACK timeout — re-authing to skip proximity check");
+      pc_failed_this_card_ = true;  // Don't retry on re-auth
+      start_select_app_();
     }
     return;
   }
@@ -1046,19 +1050,24 @@ void DesfireReaderComponent::loop() {
     uint8_t resp_len, sw1, sw2;
 
     if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
-      if (sw2 != DESFIRE_MORE_FRAMES) {
-        ESP_LOGW(TAG, "PreparePC unexpected status (sw2=0x%02X) — skipping", sw2);
-        start_read_file_();
+      // Accept both 0xAF (more frames) and 0x00 (immediate success) as valid
+      if (sw2 != DESFIRE_MORE_FRAMES && sw2 != DESFIRE_OK) {
+        // Card doesn't support proximity check or returned an error.
+        // The session may be dirty — re-select + re-auth to get a clean state.
+        ESP_LOGW(TAG, "PreparePC rejected (sw2=0x%02X) — re-authing without PC", sw2);
+        pc_failed_this_card_ = true;
+        start_select_app_();
         return;
       }
-      // resp contains: Option(1) + pRndC(7) from the card
-      if (resp_len >= 8) {
-        memcpy(pc_rnd_c_, resp + 1, 7);  // Save initial card random part
-        // Note: these 7 bytes are the first part; each ProximityCheck round
-        // returns 1 more byte, but PreparePC already gives us the initial set.
-        // We'll overwrite pc_rnd_c_ with per-round bytes in the rounds.
-        memset(pc_rnd_c_, 0, PC_NUM_ROUNDS);  // Will be filled per round
+
+      if (sw2 == DESFIRE_OK) {
+        // Some EV3 cards return 0x00 immediately with option byte.
+        // This means PreparePC succeeded — extract option and proceed to rounds.
+        ESP_LOGD(TAG, "PreparePC OK (immediate, sw2=0x00)");
       }
+
+      // resp contains: Option(1) from card
+      memset(pc_rnd_c_, 0, PC_NUM_ROUNDS);  // Will be filled per round
       ESP_LOGD(TAG, "PreparePC OK — starting %d proximity check rounds", PC_NUM_ROUNDS);
 
       // Start first round
@@ -1066,8 +1075,9 @@ void DesfireReaderComponent::loop() {
       uint8_t apdu[] = {0x90, 0xF2, 0x00, 0x00, 0x01,
                         pc_rnd_r_[0], 0x00};
       if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
-        ESP_LOGW(TAG, "ProximityCheck round 0 send failed — skipping");
-        start_read_file_();
+        ESP_LOGW(TAG, "ProximityCheck round 0 send failed — re-authing");
+        pc_failed_this_card_ = true;
+        start_select_app_();
         return;
       }
       state_ = NfcState::PC_ROUND_WAIT_ACK;
@@ -1076,8 +1086,9 @@ void DesfireReaderComponent::loop() {
     }
 
     if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
-      ESP_LOGW(TAG, "PreparePC resp timeout — skipping proximity check");
-      start_read_file_();
+      ESP_LOGW(TAG, "PreparePC resp timeout — re-authing without PC");
+      pc_failed_this_card_ = true;
+      start_select_app_();
     }
     return;
   }
