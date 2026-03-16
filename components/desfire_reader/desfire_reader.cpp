@@ -411,8 +411,9 @@ void DesfireReaderComponent::start_read_file_() {
   uint8_t apdu[24];
   uint8_t apdu_len;
 
-  if (ev2_authenticated_ && comm_mode_ != CommMode::PLAIN) {
-    // Append command CMAC for EV2 secured read
+  if (ev2_authenticated_) {
+    // EV2 session: ALL commands require CMAC, regardless of file comm mode.
+    // The comm mode only affects how the response DATA is protected.
     uint8_t mac8[8];
     compute_cmd_mac_(0xBD, cmd_data, sizeof(cmd_data), mac8);
 
@@ -828,7 +829,8 @@ void DesfireReaderComponent::loop() {
         // │  This establishes an EV2 secure channel with        │
         // │  session keys, command counters, and TI binding.    │
         // └─────────────────────────────────────────────────────┘
-        uint8_t apdu1[] = {0x90, 0x71, 0x00, 0x00, 0x01, 0x00, 0x00};
+        // Lc=0x02: keyNo(0x00) + LenPCDcap2(0x00), then Le=0x00
+        uint8_t apdu1[] = {0x90, 0x71, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00};
         if (!send_desfire_apdu_(apdu1, sizeof(apdu1))) {
           ESP_LOGE(TAG, "Auth1 (EV2First) send failed");
           handle_retry_();
@@ -973,8 +975,9 @@ void DesfireReaderComponent::loop() {
       }
 
       uint8_t decrypted[32];
-      // IV for decryption = last 16 bytes of the token we sent
-      aes_cbc_decrypt_with_key_(app_rk_, resp2, 32, token_ + 16, decrypted);
+      // EV2: card encrypts response with CBC IV=0 (not chained from our token)
+      uint8_t resp_iv[16] = {0};
+      aes_cbc_decrypt_with_key_(app_rk_, resp2, 32, resp_iv, decrypted);
 
       // Extract TI (Transaction Identifier)
       memcpy(ti_, decrypted, 4);
@@ -1256,115 +1259,108 @@ void DesfireReaderComponent::loop() {
     uint8_t decrypted[64];
     uint8_t dec_len = 0;
 
-    if (ev2_authenticated_ && comm_mode_ == CommMode::FULL) {
-      // ┌─────────────────────────────────────────────────────┐
-      // │  CommMode FULL: response = EncData || CMAC(8)       │
-      // │  Decrypt with session ENC key, verify CMAC with     │
-      // │  session MAC key.                                   │
-      // └─────────────────────────────────────────────────────┘
-      if (raw_file_len_ < 24) {  // minimum: 16 enc + 8 mac
-        ESP_LOGE(TAG, "FULL mode response too short (%d)", raw_file_len_);
+    // ┌─────────────────────────────────────────────────────────────┐
+    // │  In an EV2 session, ALL responses carry an 8-byte CMAC,    │
+    // │  regardless of the file's CommMode setting.                │
+    // │                                                            │
+    // │  CommMode determines how the DATA portion is protected:    │
+    // │    PLAIN: data in cleartext  + response CMAC(8)            │
+    // │    MAC:   data in cleartext  + response CMAC(8)            │
+    // │    FULL:  data AES-CBC encrypted + response CMAC(8)        │
+    // │                                                            │
+    // │  Without EV2 session (shouldn't happen in new code, but    │
+    // │  kept for safety): raw data, no CMAC, local data_key only. │
+    // └─────────────────────────────────────────────────────────────┘
+
+    if (ev2_authenticated_) {
+      // All EV2 responses: last 8 bytes are truncated CMAC
+      if (raw_file_len_ < 8) {
+        ESP_LOGE(TAG, "EV2 response too short for CMAC (%d bytes)", raw_file_len_);
         handle_fail_();
         return;
       }
 
-      uint8_t mac_len = 8;
-      uint8_t enc_len = raw_file_len_ - mac_len;
-      if (enc_len % 16 != 0) {
-        ESP_LOGE(TAG, "FULL mode encrypted data not block-aligned (%d)", enc_len);
-        handle_fail_();
-        return;
-      }
+      uint8_t data_len = raw_file_len_ - 8;
+      uint8_t *resp_data = raw_file_;
+      uint8_t *resp_mac  = raw_file_ + data_len;
 
-      // Compute decryption IV from command counter and TI
-      // Note: cmd_ctr_ was already incremented above, so use (cmd_ctr_ - 1)
+      // The cmd_ctr was already incremented after ReadData response.
+      // CMAC verification needs the counter value AT the time of the command.
       uint16_t saved_ctr = cmd_ctr_;
       cmd_ctr_ = saved_ctr - 1;
-      uint8_t iv[16];
-      compute_ev2_iv_(true, iv);  // true = response IV
-      cmd_ctr_ = saved_ctr;
 
-      // Decrypt
-      aes_cbc_decrypt_with_key_(ses_auth_enc_rk_, raw_file_, enc_len, iv, decrypted);
+      if (comm_mode_ == CommMode::FULL) {
+        // ── FULL: decrypt data with session ENC key, then verify CMAC ──
+        if (data_len == 0 || data_len % 16 != 0) {
+          ESP_LOGE(TAG, "FULL: encrypted data not block-aligned (%d)", data_len);
+          cmd_ctr_ = saved_ctr;
+          handle_fail_();
+          return;
+        }
 
-      // Strip ISO 9797-1 M2 padding (0x80 0x00...)
-      dec_len = enc_len;
-      while (dec_len > 0 && decrypted[dec_len - 1] == 0x00)
-        dec_len--;
-      if (dec_len > 0 && decrypted[dec_len - 1] == 0x80)
-        dec_len--;
+        uint8_t iv[16];
+        compute_ev2_iv_(true, iv);  // response IV
+        aes_cbc_decrypt_with_key_(ses_auth_enc_rk_, resp_data, data_len, iv, decrypted);
 
-      // Verify response CMAC
-      uint16_t mac_ctr = saved_ctr - 1;
-      cmd_ctr_ = mac_ctr;
-      if (!verify_resp_mac_(DESFIRE_OK, decrypted, dec_len,
-                            raw_file_ + enc_len)) {
-        ESP_LOGE(TAG, "FULL mode CMAC verification FAILED — data tampered?");
-        cmd_ctr_ = saved_ctr;
-        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-        handle_fail_();
-        return;
-      }
-      cmd_ctr_ = saved_ctr;
+        // Strip ISO 9797-1 M2 padding (0x80 0x00...)
+        dec_len = data_len;
+        while (dec_len > 0 && decrypted[dec_len - 1] == 0x00)
+          dec_len--;
+        if (dec_len > 0 && decrypted[dec_len - 1] == 0x80)
+          dec_len--;
 
-      ESP_LOGD(TAG, "FULL mode: decrypted %d bytes, CMAC verified", dec_len);
+        if (!verify_resp_mac_(DESFIRE_OK, decrypted, dec_len, resp_mac)) {
+          ESP_LOGE(TAG, "FULL: CMAC verification FAILED");
+          cmd_ctr_ = saved_ctr;
+          secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+          handle_fail_();
+          return;
+        }
 
-    } else if (ev2_authenticated_ && comm_mode_ == CommMode::MAC) {
-      // ┌─────────────────────────────────────────────────────┐
-      // │  CommMode MAC: response = Data || CMAC(8)           │
-      // │  Data is cleartext, verify CMAC integrity.          │
-      // └─────────────────────────────────────────────────────┘
-      if (raw_file_len_ < 9) {
-        ESP_LOGE(TAG, "MAC mode response too short (%d)", raw_file_len_);
-        handle_fail_();
-        return;
-      }
+        ESP_LOGD(TAG, "FULL: decrypted %d bytes, CMAC verified", dec_len);
 
-      dec_len = raw_file_len_ - 8;
-      memcpy(decrypted, raw_file_, dec_len);
+      } else {
+        // ── PLAIN or MAC: data is cleartext, verify CMAC ──
+        memcpy(decrypted, resp_data, data_len);
+        dec_len = data_len;
 
-      uint16_t saved_ctr = cmd_ctr_;
-      cmd_ctr_ = saved_ctr - 1;
-      if (!verify_resp_mac_(DESFIRE_OK, decrypted, dec_len,
-                            raw_file_ + dec_len)) {
-        ESP_LOGE(TAG, "MAC mode CMAC verification FAILED — data tampered?");
-        cmd_ctr_ = saved_ctr;
-        secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
-        handle_fail_();
-        return;
-      }
-      cmd_ctr_ = saved_ctr;
+        if (!verify_resp_mac_(DESFIRE_OK, resp_data, data_len, resp_mac)) {
+          ESP_LOGE(TAG, "EV2 response CMAC verification FAILED");
+          cmd_ctr_ = saved_ctr;
+          secure_zero_((volatile uint8_t *)decrypted, sizeof(decrypted));
+          handle_fail_();
+          return;
+        }
 
-      // If data_key is configured, also decrypt locally
-      if (has_data_key_) {
-        uint8_t cipher_len = (dec_len / 16) * 16;
-        if (cipher_len > 0) {
-          uint8_t tmp[64];
-          uint8_t zero_iv[16] = {0};
-          aes_cbc_decrypt_with_key_(data_rk_, decrypted, cipher_len, zero_iv, tmp);
-          memcpy(decrypted, tmp, cipher_len);
-          dec_len = cipher_len;
-          secure_zero_((volatile uint8_t *)tmp, sizeof(tmp));
+        ESP_LOGD(TAG, "EV2 CMAC verified (%d data bytes, mode=%s)",
+                 dec_len, comm_mode_ == CommMode::MAC ? "MAC" : "PLAIN");
+
+        // If data_key is configured, the file holds pre-encrypted ciphertext.
+        // Decrypt locally after CMAC verification.
+        if (has_data_key_) {
+          uint8_t cipher_len = (dec_len / 16) * 16;
+          if (cipher_len > 0 && cipher_len <= sizeof(decrypted)) {
+            uint8_t tmp[64];
+            uint8_t zero_iv[16] = {0};
+            aes_cbc_decrypt_with_key_(data_rk_, decrypted, cipher_len, zero_iv, tmp);
+            memcpy(decrypted, tmp, cipher_len);
+            dec_len = cipher_len;
+            secure_zero_((volatile uint8_t *)tmp, sizeof(tmp));
+            ESP_LOGD(TAG, "Local data_key decryption OK (%d bytes)", dec_len);
+          }
         }
       }
 
-      ESP_LOGD(TAG, "MAC mode: %d bytes, CMAC verified", dec_len);
+      cmd_ctr_ = saved_ctr;
 
     } else {
-      // ┌─────────────────────────────────────────────────────┐
-      // │  CommMode PLAIN: legacy path                        │
-      // │  Data may be pre-encrypted with data_key.           │
-      // │  No session-level integrity protection on the read. │
-      // └─────────────────────────────────────────────────────┘
+      // ── No EV2 session (fallback, shouldn't normally reach here) ──
       if (has_data_key_) {
         uint8_t cipher_len = (raw_file_len_ / 16) * 16;
         if (cipher_len == 0 || cipher_len > sizeof(decrypted)) {
           ESP_LOGE(TAG, "Bad cipher length (%d from %d raw)", cipher_len, raw_file_len_);
           handle_fail_();
           return;
-        }
-        if (raw_file_len_ != cipher_len) {
-          ESP_LOGD(TAG, "Stripped %d trailing bytes", raw_file_len_ - cipher_len);
         }
         uint8_t zero_iv[16] = {0};
         if (!aes_cbc_decrypt_with_key_(data_rk_, raw_file_, cipher_len, zero_iv, decrypted)) {
@@ -1375,7 +1371,6 @@ void DesfireReaderComponent::loop() {
         }
         dec_len = cipher_len;
       } else {
-        // No data_key, no encryption — raw plaintext
         memcpy(decrypted, raw_file_, raw_file_len_);
         dec_len = raw_file_len_;
       }
