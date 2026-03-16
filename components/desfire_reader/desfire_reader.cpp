@@ -395,8 +395,8 @@ void DesfireReaderComponent::start_proximity_check_() {
   memset(pc_rnd_c_, 0, PC_NUM_ROUNDS);
   pc_current_round_ = 0;
 
-  // PreparePC: 90 F0 00 00 00
-  uint8_t apdu[] = {0x90, 0xF0, 0x00, 0x00, 0x00};
+  // PreparePC: CLA=90 INS=F0 P1=00 P2=00 Lc=01 Data=00(option) Le=00
+  uint8_t apdu[] = {0x90, 0xF0, 0x00, 0x00, 0x01, 0x00, 0x00};
   if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
     ESP_LOGE(TAG, "PreparePC send failed");
     handle_retry_();
@@ -1050,9 +1050,20 @@ void DesfireReaderComponent::loop() {
     uint8_t resp_len, sw1, sw2;
 
     if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
-      // Accept both 0xAF (more frames) and 0x00 (immediate success) as valid
+      ESP_LOGD(TAG, "PreparePC response: sw1=0x%02X sw2=0x%02X len=%d", sw1, sw2, resp_len);
+      if (resp_len > 0)
+        ESP_LOGD(TAG, "PreparePC data[0]=0x%02X", resp[0]);
+
+      if (sw1 != DESFIRE_SW1) {
+        // Not a DESFire response — card may not support ISO-wrapped PC
+        ESP_LOGW(TAG, "PreparePC: non-DESFire SW1 (0x%02X) — PC not supported?", sw1);
+        pc_failed_this_card_ = true;
+        prev_uid_len_ = 0;
+        start_release_();
+        return;
+      }
+
       if (sw2 != DESFIRE_MORE_FRAMES && sw2 != DESFIRE_OK) {
-        // Card rejected PC — session is dirty, release and re-detect cleanly
         ESP_LOGW(TAG, "PreparePC rejected (sw2=0x%02X) — releasing for clean retry", sw2);
         pc_failed_this_card_ = true;
         prev_uid_len_ = 0;
