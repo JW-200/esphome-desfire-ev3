@@ -1037,9 +1037,10 @@ void DesfireReaderComponent::loop() {
       return;
     }
     if (millis() - state_entered_at_ > ACK_TIMEOUT_MS) {
-      ESP_LOGW(TAG, "PreparePC ACK timeout — re-authing to skip proximity check");
-      pc_failed_this_card_ = true;  // Don't retry on re-auth
-      start_select_app_();
+      ESP_LOGW(TAG, "PreparePC ACK timeout — releasing target for clean retry");
+      pc_failed_this_card_ = true;
+      prev_uid_len_ = 0;  // Force re-detect of same card
+      start_release_();
     }
     return;
   }
@@ -1051,32 +1052,29 @@ void DesfireReaderComponent::loop() {
     if (read_desfire_apdu_(resp, sizeof(resp), resp_len, sw1, sw2)) {
       // Accept both 0xAF (more frames) and 0x00 (immediate success) as valid
       if (sw2 != DESFIRE_MORE_FRAMES && sw2 != DESFIRE_OK) {
-        // Card doesn't support proximity check or returned an error.
-        // The session may be dirty — re-select + re-auth to get a clean state.
-        ESP_LOGW(TAG, "PreparePC rejected (sw2=0x%02X) — re-authing without PC", sw2);
+        // Card rejected PC — session is dirty, release and re-detect cleanly
+        ESP_LOGW(TAG, "PreparePC rejected (sw2=0x%02X) — releasing for clean retry", sw2);
         pc_failed_this_card_ = true;
-        start_select_app_();
+        prev_uid_len_ = 0;
+        start_release_();
         return;
       }
 
       if (sw2 == DESFIRE_OK) {
-        // Some EV3 cards return 0x00 immediately with option byte.
-        // This means PreparePC succeeded — extract option and proceed to rounds.
         ESP_LOGD(TAG, "PreparePC OK (immediate, sw2=0x00)");
       }
 
-      // resp contains: Option(1) from card
-      memset(pc_rnd_c_, 0, PC_NUM_ROUNDS);  // Will be filled per round
+      memset(pc_rnd_c_, 0, PC_NUM_ROUNDS);
       ESP_LOGD(TAG, "PreparePC OK — starting %d proximity check rounds", PC_NUM_ROUNDS);
 
-      // Start first round
       pc_current_round_ = 0;
       uint8_t apdu[] = {0x90, 0xF2, 0x00, 0x00, 0x01,
                         pc_rnd_r_[0], 0x00};
       if (!send_desfire_apdu_(apdu, sizeof(apdu))) {
-        ESP_LOGW(TAG, "ProximityCheck round 0 send failed — re-authing");
+        ESP_LOGW(TAG, "ProximityCheck round 0 send failed — releasing");
         pc_failed_this_card_ = true;
-        start_select_app_();
+        prev_uid_len_ = 0;
+        start_release_();
         return;
       }
       state_ = NfcState::PC_ROUND_WAIT_ACK;
@@ -1085,9 +1083,10 @@ void DesfireReaderComponent::loop() {
     }
 
     if (millis() - state_entered_at_ > RESP_TIMEOUT_MS) {
-      ESP_LOGW(TAG, "PreparePC resp timeout — re-authing without PC");
+      ESP_LOGW(TAG, "PreparePC resp timeout — releasing for clean retry");
       pc_failed_this_card_ = true;
-      start_select_app_();
+      prev_uid_len_ = 0;
+      start_release_();
     }
     return;
   }
