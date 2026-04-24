@@ -32,6 +32,13 @@ void DesfireReaderComponent::recover_i2c_bus_() {
   this->read(dummy_read, sizeof(dummy_read));
   delay(5);
 }
+  
+void DesfireReaderComponent::pn532_wakeup_() {
+  static const uint8_t wakeup[] = {
+      0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+  this->write(wakeup, sizeof(wakeup));
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  PN532 I2C — non-blocking primitives
