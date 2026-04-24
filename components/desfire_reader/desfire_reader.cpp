@@ -16,71 +16,21 @@ void DesfireReaderComponent::secure_zero_(volatile uint8_t *buf, uint8_t len) {
 // ═══════════════════════════════════════════════════════════════
 
 void DesfireReaderComponent::recover_i2c_bus_() {
-#ifdef USE_ESP32
-  if (sda_pin_ < 0 || scl_pin_ < 0) {
-    ESP_LOGW(TAG, "I2C bus recovery skipped — SDA/SCL pins not configured");
-    delay(10);
-    return;
-  }
+  ESP_LOGW(TAG, "Attempting software recovery of PN532...");
 
-  gpio_num_t sda = (gpio_num_t)sda_pin_;
-  gpio_num_t scl = (gpio_num_t)scl_pin_;
+  // Instead of breaking the GPIO matrix, we send a sequence of dummy bytes.
+  // If the PN532 is stuck mid-read, clocking out 0x00s can sometimes fulfill 
+  // its expected payload and force it back to a ready state.
+  uint8_t dummy_flush[16] = {0};
+  
+  // Suppress errors temporarily while we blind-fire data
+  this->write(dummy_flush, sizeof(dummy_flush));
+  delay(5);
 
-  gpio_reset_pin(sda);
-  gpio_set_direction(sda, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
-  delayMicroseconds(20);
-
-  if (gpio_get_level(sda) != 0) {
-    gpio_reset_pin(sda);
-    ESP_LOGD(TAG, "I2C bus recovery: SDA already free — skipping clock-out");
-    uint8_t dummy;
-    this->read(&dummy, 1);
-    return;
-  }
-
-  ESP_LOGW(TAG, "I2C bus recovery — SDA stuck low, clocking out "
-           "(SDA=GPIO%d SCL=GPIO%d). Other I2C devices on this bus may be "
-           "briefly interrupted.", sda_pin_, scl_pin_);
-
-  gpio_reset_pin(scl);
-  gpio_set_direction(scl, GPIO_MODE_OUTPUT_OD);
-  gpio_set_level(scl, 1);
-
-  for (int i = 0; i < 9; i++) {
-    gpio_set_level(scl, 0);
-    delayMicroseconds(5);
-    gpio_set_level(scl, 1);
-    delayMicroseconds(5);
-    if (gpio_get_level(sda) == 1)
-      break;
-  }
-
-  gpio_set_direction(sda, GPIO_MODE_OUTPUT_OD);
-  gpio_set_level(sda, 0);
-  delayMicroseconds(5);
-  gpio_set_level(scl, 1);
-  delayMicroseconds(5);
-  gpio_set_level(sda, 1);
-  delayMicroseconds(5);
-
-  gpio_set_direction(scl, GPIO_MODE_INPUT_OUTPUT_OD);
-  gpio_set_level(scl, 1);
-  gpio_set_direction(sda, GPIO_MODE_INPUT_OUTPUT_OD);
-  gpio_set_level(sda, 1);
-
-  uint8_t dummy;
-  this->read(&dummy, 1);
-#else
-  delay(10);
-#endif
-}
-
-void DesfireReaderComponent::pn532_wakeup_() {
-  static const uint8_t wakeup[] = {
-      0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-  this->write(wakeup, sizeof(wakeup));
+  // Clear any pending data the PN532 is trying to send to us
+  uint8_t dummy_read[16];
+  this->read(dummy_read, sizeof(dummy_read));
+  delay(5);
 }
 
 // ═══════════════════════════════════════════════════════════════
